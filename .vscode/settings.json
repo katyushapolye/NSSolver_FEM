@@ -1,0 +1,16 @@
+{
+    "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.intelliSenseCachePath": "${workspaceFolder}/.vscode/ipch",
+    "C_Cpp.intelliSenseCacheSize": 5120,
+    "C_Cpp.intelliSenseUpdateDelay": 2000,
+    "C_Cpp.workspaceParsingPriority": "low",
+    "C_Cpp.enhancedColorization": "disabled",
+    "C_Cpp.dimInactiveRegions": false,
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/node_modules/*/**": true,
+        "**/.vscode/ipch/**": true,
+        "**/build/**": true
+    }
+}
