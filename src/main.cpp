@@ -87,11 +87,11 @@ int main()
     //solver.step();
  
     INSSolver::StepSimulation(IT);
-
+    ImGui::Text("Current DivSum: %f ", INSSolver::getDivSum());
     /*
     //ImGui::Text("Current Time: %f s", solver.getCurrentTime());
     //ImGui::SameLine();
-    //ImGui::Text("Current Energy: %f j", solver.getEnergy());
+  ImGui::Text("Current Energy: %f j", solver.getEnergy());
 
     //time.push_back(solver.getCurrentTime());
     //energy.push_back(solver.getEnergy());

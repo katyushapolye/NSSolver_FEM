@@ -1,4 +1,3 @@
-
 #include "INSSolver.h"
 
 using namespace dealii;
@@ -7,7 +6,7 @@ using namespace dealii;
 
 // Mesh and finite elements
 Triangulation<2> INSSolver::mesh;
-FE_Q<2> INSSolver::fe_velocity(INSSolver::K);
+FESystem<2> INSSolver::fe_velocity(FE_Q<2>(INSSolver::K), 2);  // 2 components for velocity
 FE_Q<2> INSSolver::fe_pressure(INSSolver::K - 1);
 
 // DoF handlers
@@ -17,395 +16,397 @@ DoFHandler<2> INSSolver::dof_handler_pressure(INSSolver::mesh);
 // Sparsity patterns and matrices
 SparsityPattern INSSolver::velocity_sparsity_pattern;
 SparseMatrix<double> INSSolver::velocity_global_mat;
-SparseMatrix<double> INSSolver::x_global_mat;
-SparseMatrix<double> INSSolver::y_global_mat;
+Vector<double> INSSolver::velocity_rhs;
+
 SparsityPattern INSSolver::pressure_sparsity_pattern;
 SparseMatrix<double> INSSolver::pressure_global_mat;
-
-// Solution vectors
-Vector<double> INSSolver::u_x;
-Vector<double> INSSolver::u_y;
-Vector<double> INSSolver::u_star_x;
-Vector<double> INSSolver::u_star_y;
-Vector<double> INSSolver::u_ant_x;
-Vector<double> INSSolver::u_ant_y;
-Vector<double> INSSolver::x_velocity_rhs;
-Vector<double> INSSolver::y_velocity_rhs;
-Vector<double> INSSolver::p;
-Vector<double> INSSolver::p_ant;
 Vector<double> INSSolver::pressure_rhs;
 
-// Function implementations
-void INSSolver::make_grid() {
-    GridGenerator::hyper_cube(mesh, x0, xf);
+// Solution vectors
+Vector<double> INSSolver::velocity;
+Vector<double> INSSolver::velocity_star;
+Vector<double> INSSolver::velocity_old;
+Vector<double> INSSolver::p;
+Vector<double> INSSolver::p_ant;
+
+AffineConstraints<double> INSSolver::velocity_constraints;
+AffineConstraints<double> INSSolver::pressure_constraints;
+
+// Boundary condition helper class
+template <int dim>
+class VelocityBoundaryValues : public Function<dim>
+{
+public:
+    VelocityBoundaryValues() : Function<dim>(dim) {}
     
-    mesh.refine_global(5);
-    /*
-    const unsigned int n_boundary_refinements = 1;
-    const double boundary_distance = 0.1;
-    for (unsigned int step = 0; step < n_boundary_refinements; ++step)
-        {
-            for (auto &cell : mesh.active_cell_iterators())
-            {
-                // Check if cell is near any boundary
-                bool near_boundary = false;
-
-
-                // Alternative: refine based on distance from boundary
-                Point<2> center = cell->center();
-                if (std::abs(center[0]) > 1.0 - boundary_distance ||
-                    std::abs(center[1]) > 1.0 - boundary_distance)
-                {
-                    near_boundary = true;
-                }
-
-                if (near_boundary)
-                    cell->set_refine_flag();
-            }
-
-            mesh.execute_coarsening_and_refinement();
+    virtual double value(const Point<dim> &p, const unsigned int component = 0) const override
+    {
+        if (component == 0) {
+            // u_x component
+            if (std::abs(p[1] - 1.0) < 1e-10)
+                return 1.0;
+            return 0.0;
         }
-    */
+        // u_y component
+        return 0.0;
+    }
+    
+    virtual void vector_value(const Point<dim> &p, Vector<double> &values) const override
+    {
+        values(0) = value(p, 0);
+        values(1) = value(p, 1);
+    }
+};
 
-    std::cout << "[INSSolver] - Mesh created - active elements: "  << mesh.n_active_cells() << std::endl;
+// Function implementations
+void INSSolver::make_grid()
+{
+    GridGenerator::hyper_cube(mesh, x0, xf);
+    mesh.refine_global(5);
+    const unsigned int n_boundary_refinements = 1  ;
+    const double boundary_distance = 0.1;  // Distance from boundary to refine
+
+    for (unsigned int step = 0; step < n_boundary_refinements; ++step)
+    {
+        for (auto &cell : mesh.active_cell_iterators())
+        {
+            // Check if cell is near any boundary
+            bool near_boundary = false;
+            
+            
+            // Alternative: refine based on distance from boundary
+            Point<2> center = cell->center();
+            if (std::abs(center[0]) > 1.0 - boundary_distance ||  std::abs(center[1]) > 1.0 - boundary_distance || std::abs(center[1]) < boundary_distance ||  std::abs(center[0]) < boundary_distance )
+            {
+                near_boundary = true;
+            }
+            
+            if (near_boundary)
+                cell->set_refine_flag();
+        }
+        
+        mesh.execute_coarsening_and_refinement();
+    }
+    std::cout << "[INSSolver] - Mesh created - active elements: " << mesh.n_active_cells() << std::endl;
 }
 
-void INSSolver::setup_system() {
+void INSSolver::setup_system()
+{
     // Distribute DoFs
     dof_handler_velocity.distribute_dofs(fe_velocity);
     dof_handler_pressure.distribute_dofs(fe_pressure);
-    
+
     std::cout << "[INSSolver] - Velocity DoFs: " << dof_handler_velocity.n_dofs() << std::endl;
     std::cout << "[INSSolver] - Pressure DoFs: " << dof_handler_pressure.n_dofs() << std::endl;
+
+    // Setup velocity constraints
+    velocity_constraints.clear();
+    DoFTools::make_hanging_node_constraints(dof_handler_velocity, velocity_constraints);
     
+    // Add Dirichlet BCs for velocity
+    VectorTools::interpolate_boundary_values(
+        dof_handler_velocity,
+        0,
+        VelocityBoundaryValues<DIM>(),
+        velocity_constraints
+    );
+    velocity_constraints.close();
+
+    // Setup pressure constraints
+    pressure_constraints.clear();
+    DoFTools::make_hanging_node_constraints(dof_handler_pressure, pressure_constraints);
+
+    
+    // Pin first DOF to zero
+    pressure_constraints.add_line(0);
+    
+    pressure_constraints.close();
+
+
     // Setup velocity sparsity pattern and matrix
     DynamicSparsityPattern dsp_velocity(dof_handler_velocity.n_dofs());
-    DoFTools::make_sparsity_pattern(dof_handler_velocity, dsp_velocity);
+    DoFTools::make_sparsity_pattern(dof_handler_velocity, dsp_velocity, velocity_constraints);
     velocity_sparsity_pattern.copy_from(dsp_velocity);
     velocity_global_mat.reinit(velocity_sparsity_pattern);
-    x_global_mat.reinit(velocity_sparsity_pattern);
-    y_global_mat.reinit(velocity_sparsity_pattern);
+
     // Setup pressure sparsity pattern and matrix
     DynamicSparsityPattern dsp_pressure(dof_handler_pressure.n_dofs());
-    DoFTools::make_sparsity_pattern(dof_handler_pressure, dsp_pressure);
+    DoFTools::make_sparsity_pattern(dof_handler_pressure, dsp_pressure, pressure_constraints);
     pressure_sparsity_pattern.copy_from(dsp_pressure);
     pressure_global_mat.reinit(pressure_sparsity_pattern);
 
-    
     // Resize vectors
-    u_x.reinit(dof_handler_velocity.n_dofs());
-    u_y.reinit(dof_handler_velocity.n_dofs());
-    x_velocity_rhs.reinit(dof_handler_velocity.n_dofs());
-    y_velocity_rhs.reinit(dof_handler_velocity.n_dofs());
-    u_star_x.reinit(dof_handler_velocity.n_dofs());
-    u_star_y.reinit(dof_handler_velocity.n_dofs());
-    u_ant_x.reinit(dof_handler_velocity.n_dofs());
-    u_ant_y.reinit(dof_handler_velocity.n_dofs());
+    velocity.reinit(dof_handler_velocity.n_dofs());
+    velocity_star.reinit(dof_handler_velocity.n_dofs());
+    velocity_old.reinit(dof_handler_velocity.n_dofs());
+    velocity_rhs.reinit(dof_handler_velocity.n_dofs());
+    
     p.reinit(dof_handler_pressure.n_dofs());
     p_ant.reinit(dof_handler_pressure.n_dofs());
     pressure_rhs.reinit(dof_handler_pressure.n_dofs());
-
-
 }
 
-void INSSolver::InitializeFEMSolver() {
-
-
-
+void INSSolver::InitializeFEMSolver()
+{
     make_grid();
     setup_system();
 
-    double h_min = 1.0/128.0;
+    double h_min = 1.0 / 128.0;
     double dt_diff = h_min * h_min / (4.0 * viscosity * DIM);
-    double dt_conv = h_min / 1.0; // Assuming max velocity ~1.0
+    double dt_conv = h_min / 1.0;
     std::cout << "Suggested dt_max (diffusion): " << dt_diff << std::endl;
     std::cout << "Suggested dt_max (convection): " << dt_conv << std::endl;
 }
 
-void INSSolver::StepSimulation(int IT) {
-    assemble_velocity_matrices(INSSolver::u_ant_x,INSSolver::u_ant_y);
+void INSSolver::StepSimulation(int IT)
+{
+    assemble_velocity_matrix();
     solve_intermediate_velocity();
     assemble_pressure_matrix();
     solve_pressure();
     project();
-    INSSolver::u_ant_x = INSSolver::u_x;
-    INSSolver::u_ant_y = INSSolver::u_y;
-    
-    if(IT%1 ==0){
+    velocity_old = velocity;
+
+    if (IT % 1 == 0)
+    {
         output(IT);
     }
+}
+
+double INSSolver::getDivSum()
+{
+    double divsum = 0.0;
+    double volume = 0.0;
     
-
-
+    const QGauss<DIM> quadrature(fe_velocity.degree + 1);
+    FEValues<DIM> fe_values(fe_velocity, quadrature,
+                            update_gradients | update_JxW_values | update_quadrature_points);
+    
+    const FEValuesExtractors::Vector velocities(0);
+    std::vector<Tensor<2, DIM>> grad_u(quadrature.size());
+    
+    // Define interior region (avoiding boundaries)
+    const double boundary_tolerance = 0.05;  // Stay away from boundaries
+    
+    for (const auto &cell : dof_handler_velocity.active_cell_iterators())
+    {
+        fe_values.reinit(cell);
+        fe_values[velocities].get_function_gradients(velocity, grad_u);
+        
+        for (unsigned int q = 0; q < quadrature.size(); q++)
+        {
+            const Point<DIM> &point = fe_values.quadrature_point(q);
+            
+            // Only compute divergence for interior points
+            bool is_interior = true;
+            for (unsigned int d = 0; d < DIM; ++d)
+            {
+                if (point[d] < x0 + boundary_tolerance || 
+                    point[d] > xf - boundary_tolerance)
+                {
+                    is_interior = false;
+                    break;
+                }
+            }
+            
+            if (is_interior)
+            {
+                double div = trace(grad_u[q]);
+                divsum += std::abs(div) * fe_values.JxW(q);
+                volume += fe_values.JxW(q);
+            }
+        }
+    }
+    
+    // Return average divergence (normalized by interior volume)
+    return (volume > 0) ? divsum / volume : 0.0;
 }
 
-double INSSolver::U_X_BOUNDARY_CONDITION(double x, double y) {
-    // Return 1.0 on top boundary (y = 1), 0 elsewhere 
-    if (std::abs(y - yf) < 1e-10)
-        return 1.0;
-    return 0.0;
-}
-
-double INSSolver::U_Y_BOUNDARY_CONDITION(double x, double y) {
-    return 0.0;
-}
-
-double INSSolver::P_BOUNDARY_CONDITION(double x, double y) {
-    return 0.0;
-}
-
-void INSSolver::assemble_velocity_matrices(Vector<double> velocity_x, Vector<double> velocity_y) {
-
+void INSSolver::assemble_velocity_matrix()
+{
     velocity_global_mat = 0;
-    x_velocity_rhs= 0;
-    y_velocity_rhs= 0;
-    //we will use gauss
-    const QGauss<DIM> quadrature(fe_velocity.degree +1);
-    FEValues<DIM> fe_values(fe_velocity, quadrature, update_quadrature_points  | update_values | update_gradients | update_JxW_values);
+    velocity_rhs = 0;
+
+    const QGauss<DIM> quadrature(fe_velocity.degree + 1);
+    FEValues<DIM> fe_values(fe_velocity, quadrature, 
+                            update_quadrature_points | update_values | 
+                            update_gradients | update_JxW_values);
+
     const unsigned int dof_count = fe_velocity.n_dofs_per_cell();
+    const unsigned int n_q = quadrature.size();
 
-    //these are the local element mats
-    FullMatrix<double> stiffnessMat;    //K
-    FullMatrix<double> convectionMat;   //C
-    FullMatrix<double> massMat;         //M
-    Vector<double> x_rhs;                 
-    Vector<double> y_rhs;    
-    stiffnessMat.reinit(dof_count, dof_count);
-    convectionMat.reinit(dof_count, dof_count);
-    massMat.reinit(dof_count, dof_count);
-    x_rhs.reinit(dof_count);
-    y_rhs.reinit(dof_count);
+    FullMatrix<double> local_mat(dof_count, dof_count);
+    Vector<double> local_rhs(dof_count);
+    std::vector<types::global_dof_index> local_to_global(dof_count);
 
+    // Extractors for vector components
+    const FEValuesExtractors::Vector velocities(0);
+    
+    // Storage for shape function values/gradients
+    std::vector<Tensor<1, DIM>> phi_u(dof_count);
+    std::vector<Tensor<2, DIM>> grad_phi_u(dof_count);
+    std::vector<double> div_phi_u(dof_count);
+    
+    // Storage for old velocity values
+    std::vector<Tensor<1, DIM>> old_velocity_values(n_q);
 
-    std::vector<types::global_dof_index> local_to_global(dof_count); //translation dictorianory from local->global
-
-    for(const auto& cell : dof_handler_velocity.active_cell_iterators()){
+    for (const auto &cell : dof_handler_velocity.active_cell_iterators())
+    {
         fe_values.reinit(cell);
         cell->get_dof_indices(local_to_global);
 
-        stiffnessMat = 0;
-        convectionMat = 0;
-        massMat = 0;
-        x_rhs = 0; 
-        y_rhs = 0;
-        for (const unsigned int q : fe_values.quadrature_point_indices()){   //for each quadrature point in our element
-            double x = fe_values.quadrature_point(q)[0];//just in case, this is our global coords of this point
-            double y = fe_values.quadrature_point(q)[1];//just in case, this is our global coords of this point
+        local_mat = 0;
+        local_rhs = 0;
 
-            //now, i dont know if this is necessary, i need to double check the maths here!
-            // -> in my mind it shouldnt be since this is the previous iteration solution, so just like u0 in the font there isnt any thing we need to do
-            // --> I am getting asolutetedly mindmelted by all this localspace global space transformations
-            double b_x_q = 0.0, b_y_q = 0.0;
-            double u_ant_h = 0.0, v_ant_h = 0.0;
-            for (unsigned int k : fe_values.dof_indices()) {
-                b_x_q += velocity_x[local_to_global[k]] * fe_values.shape_value(k, q);
-                b_y_q += velocity_y[local_to_global[k]] * fe_values.shape_value(k, q);
-                u_ant_h += u_ant_x[local_to_global[k]]  * fe_values.shape_value(k, q);
-                v_ant_h += u_ant_y[local_to_global[k]]  * fe_values.shape_value(k, q);
+        // Get old velocity values at quadrature points
+        fe_values[velocities].get_function_values(velocity_old, old_velocity_values);
+
+        for (unsigned int q = 0; q < n_q; ++q)
+        {
+            // Precompute shape function values for this quadrature point
+            for (unsigned int k = 0; k < dof_count; ++k)
+            {
+                phi_u[k] = fe_values[velocities].value(k, q);
+                grad_phi_u[k] = fe_values[velocities].gradient(k, q);
+                div_phi_u[k] = fe_values[velocities].divergence(k, q);
             }
 
-            for (const unsigned int i : fe_values.dof_indices()){
-                for (const unsigned int j : fe_values.dof_indices()){
-                    massMat(i,j) += fe_values.shape_value(i, q) * fe_values.shape_value(j, q) * fe_values.JxW(q);
-                    stiffnessMat(i,j) += fe_values.shape_grad(i, q) * fe_values.shape_grad(j, q) * fe_values.JxW(q);
-                    convectionMat(i,j) += (b_x_q*fe_values.shape_grad(j, q)[0] + b_y_q*fe_values.shape_grad(j, q)[1])*fe_values.shape_value(i,q)*fe_values.JxW(q);
+            const Tensor<1, DIM> &u_old = old_velocity_values[q];
 
+            for (unsigned int i = 0; i < dof_count; ++i)
+            {
+                for (unsigned int j = 0; j < dof_count; ++j)
+                {
+                    // Mass matrix: (phi_i, phi_j)
+                    local_mat(i, j) += phi_u[i] * phi_u[j] * fe_values.JxW(q);
+                    
+                    // Stiffness matrix: nu * dt * (grad phi_i, grad phi_j)
+                    local_mat(i, j) += viscosity * dt * 
+                                      scalar_product(grad_phi_u[i], grad_phi_u[j]) * 
+                                      fe_values.JxW(q);
+                    
+                    // Convection: dt * (u_old · grad phi_j) * phi_i
+                    local_mat(i, j) += dt * (u_old * grad_phi_u[j]) * phi_u[i] * 
+                                      fe_values.JxW(q);
                 }
 
-
-                x_rhs(i) += fe_values.shape_value(i,q) * (u_ant_h )* fe_values.JxW(q); //if needed, add the font here with x and y 
-                y_rhs(i) += fe_values.shape_value(i,q) * (v_ant_h )* fe_values.JxW(q); //or add when the transfer happen
-   
+                // RHS: M * u_old
+                local_rhs(i) += phi_u[i] * u_old * fe_values.JxW(q);
             }
-
-
-
-
         }
 
-        /*local font -> this is the way the tutorialç show, but the above should have the same effect if im not crazy
-        //for (const unsigned int i : fe_values.dof_indices()){
-        //    for (const unsigned int k : fe_values.dof_indices()){
-        //        //x_rhs(i) += massMat(i,k) * u_ant_x[local_to_global[k]];
-        //        //y_rhs(i) += massMat(i,k) * u_ant_y[local_to_global[k]];
-        //    }
-        //}
-        */
-
-        //dealii doesnt like doing dt*matrix  like eigen so we do it in parts
-        FullMatrix<double> localSystemMat(massMat);
-        localSystemMat.add(viscosity * dt, stiffnessMat); //now, because of the part integartion, this is a positive sign, not negative like in FDM
-        localSystemMat.add(dt, convectionMat);
-
-
-        //passing to global matrix assembly 
-            for (const unsigned int i : fe_values.dof_indices()){
-                for (const unsigned int j : fe_values.dof_indices()){
-                    velocity_global_mat.add(local_to_global[i],local_to_global[j], localSystemMat(i, j));
-                }
-
-            x_velocity_rhs(local_to_global[i]) += x_rhs(i);
-            y_velocity_rhs(local_to_global[i]) += y_rhs(i);
-            }
-
+        velocity_constraints.distribute_local_to_global(
+            local_mat, local_rhs, local_to_global, 
+            velocity_global_mat, velocity_rhs);
     }
 
-    x_global_mat.copy_from(velocity_global_mat);
-    y_global_mat.copy_from(velocity_global_mat);
-
-    std::cout << "System Assembly Completed! - Setting Dirichlet border conditions!";
-
-
-    std::map<types::global_dof_index,double> u_boundary_values;
-    std::map<types::global_dof_index,double> v_boundary_values;
-    auto u_boundary_function = [](const Point<DIM>& p){
-        return U_X_BOUNDARY_CONDITION(p[0],p[1]);
-    };
-    auto v_boundary_function = [](const Point<DIM>& p){
-        return U_Y_BOUNDARY_CONDITION(p[0],p[1]);
-    };
-
-    VectorTools::interpolate_boundary_values(dof_handler_velocity,types::boundary_id(0),ScalarFunctionFromFunctionObject<DIM>(u_boundary_function),u_boundary_values);
-    VectorTools::interpolate_boundary_values(dof_handler_velocity,types::boundary_id(0),ScalarFunctionFromFunctionObject<DIM>(v_boundary_function),v_boundary_values);
-
-
-
-    MatrixTools::apply_boundary_values(u_boundary_values,x_global_mat,u_star_x,x_velocity_rhs);
-    MatrixTools::apply_boundary_values(v_boundary_values,y_global_mat,u_star_y,y_velocity_rhs);
-
-    std::cout << "Border conditions set - Velocity System is ready for solution!\n";
-
-
+    std::cout << "Velocity system assembled!" << std::endl;
 }
 
-void INSSolver::assemble_pressure_matrix() {
-    // the equation for pressure laplacian p = 1/dt * div of ustar, note that, u start has a degree of pressure + 1
+void INSSolver::assemble_pressure_matrix()
+{
     pressure_global_mat = 0.0;
     pressure_rhs = 0.0;
-    const QGauss<DIM> quadrature(fe_pressure.degree + 1); //this here make sthis works;
-    //we use the same quadrature poitns for both fe in pressure and velocity, so the gradient is located at the right place!
-    FEValues<DIM> fe_values(fe_pressure,quadrature, update_quadrature_points  | update_values | update_gradients | update_JxW_values);
-    FEValues<DIM> fe_values_u(fe_velocity, quadrature, update_gradients);
+
+    const QGauss<DIM> quadrature(fe_pressure.degree + 1);
+    FEValues<DIM> fe_p(fe_pressure, quadrature, 
+                       update_values | update_gradients | update_JxW_values);
+    FEValues<DIM> fe_u(fe_velocity, quadrature, update_gradients);
+
     const unsigned int dofs = fe_pressure.n_dofs_per_cell();
-    const unsigned int dofs_velocity = fe_velocity.n_dofs_per_cell();
-    
+    const unsigned int n_q = quadrature.size();
 
     FullMatrix<double> local_mat(dofs, dofs);
     Vector<double> local_rhs(dofs);
     std::vector<types::global_dof_index> local_to_global(dofs);
-    std::vector<types::global_dof_index> local_to_global_velocity(dofs_velocity);
 
+    const FEValuesExtractors::Vector velocities(0);
+    std::vector<Tensor<2, DIM>> grad_u_star(n_q);
 
+    auto cell_p = dof_handler_pressure.begin_active();
+    auto cell_u = dof_handler_velocity.begin_active();
 
-
-    std::vector<Tensor<1,DIM>> grad_u_star_x(quadrature.size());
-    std::vector<Tensor<1,DIM>> grad_u_star_y(quadrature.size());
-
-
-    for(const auto& cell : dof_handler_pressure.active_cell_iterators()){ //for each element
+    for (; cell_p != dof_handler_pressure.end(); ++cell_p, ++cell_u)
+    {
         local_mat = 0.0;
         local_rhs = 0.0;
-        cell->get_dof_indices(local_to_global);
-        
-        //we also need the velocity cell, since it lives in  different dof handler
-        //deal keeps them consistent as long as we havent messed them independently
-        const auto cell_velocity=  typename DoFHandler<DIM>::active_cell_iterator( &mesh,  cell->level(),  cell->index(), &dof_handler_velocity );
-        fe_values.reinit(cell);
-        fe_values_u.reinit(cell_velocity); //we want the gradient of the u 
+        cell_p->get_dof_indices(local_to_global);
 
-        fe_values_u.get_function_gradients(u_star_x, grad_u_star_x);
-        fe_values_u.get_function_gradients(u_star_y, grad_u_star_y);
+        fe_p.reinit(cell_p);
+        fe_u.reinit(cell_u);
 
-        for(const unsigned int q : fe_values.quadrature_point_indices()){ //for each quadrature point
-            double x = fe_values.quadrature_point(q)[0];//just in case, this is our global coords of this point
-            double y = fe_values.quadrature_point(q)[1];
+        fe_u[velocities].get_function_gradients(velocity_star, grad_u_star);
 
-            const double div_u_star =  grad_u_star_x[q][0] + grad_u_star_y[q][1]; 
+        for (unsigned int q = 0; q < n_q; ++q)
+        {
+            const double div_u_star = trace(grad_u_star[q]);
 
-
-            for(const unsigned int i: fe_values.dof_indices()){
-                for(const unsigned int j : fe_values.dof_indices()){
-                    //basically a sitffness mat
-                    local_mat(i,j) += fe_values.shape_grad(j,q) * fe_values.shape_grad(i,q) * fe_values.JxW(q);
-                    
-
+            for (unsigned int i = 0; i < dofs; ++i)
+            {
+                for (unsigned int j = 0; j < dofs; ++j)
+                {
+                    // Laplacian: (grad phi_i, grad phi_j)
+                    local_mat(i, j) += fe_p.shape_grad(j, q) * fe_p.shape_grad(i, q) * 
+                                      fe_p.JxW(q);
                 }
+
+                // RHS: (-1/dt) * div(u_star) * phi_i
+                local_rhs(i) += (-1.0 / dt) * div_u_star * fe_p.shape_value(i, q) * 
+                               fe_p.JxW(q);
             }
-
-            for (const unsigned int i: fe_values.dof_indices()) {
-                local_rhs(i) +=  (1.0 / dt) *  div_u_star *  fe_values.shape_value(i, q) *  fe_values.JxW(q);
-                //there maybe a minus here. maybe
-            }
-
         }
 
-
-        for (const unsigned int i : fe_values.dof_indices()){
-        for (const unsigned int j : fe_values.dof_indices()){
-                    pressure_global_mat.add(local_to_global[i],local_to_global[j], local_mat(i, j));
-        }
-
-            pressure_rhs(local_to_global[i]) += local_rhs(i);
-
-        }
-
-
+        pressure_constraints.distribute_local_to_global(
+            local_mat, local_rhs, local_to_global, 
+            pressure_global_mat, pressure_rhs);
     }
 
-    std::cout << "Pressure system setup completed! - No Dirichlet boundary conditions to be set, rememember to subtract the mean!" << std::endl;
-
-
-    pressure_global_mat.set(0, 0, 1.0);
-    pressure_rhs(0) = 0.0;
-
-    
-
-
-
-
-
+    std::cout << "Pressure system assembled!" << std::endl;
 }
 
-void INSSolver::solve_intermediate_velocity() {
-    // Use BiCGStab for non-symmetric systems
-    SolverControl solver_control_x(10000, 1e-6 * x_velocity_rhs.l2_norm());
-    SolverBicgstab<Vector<double>> solver_x(solver_control_x);
-    
-    solver_x.solve(x_global_mat, u_star_x, x_velocity_rhs, PreconditionIdentity());
-    std::cout << solver_control_x.last_step() << " BiCGStab iterations needed to obtain convergence in u component." << std::endl;
-    
-    SolverControl solver_control_y(10000, 1e-6 * y_velocity_rhs.l2_norm());
-    SolverBicgstab<Vector<double>> solver_y(solver_control_y);
-    
-    solver_y.solve(y_global_mat, u_star_y, y_velocity_rhs, PreconditionIdentity());
-    std::cout << solver_control_y.last_step() << " BiCGStab iterations needed to obtain convergence in v component." << std::endl;
+void INSSolver::solve_intermediate_velocity()
+{
+    SolverControl solver_control(100000, 1e-12 * velocity_rhs.l2_norm());
+    SolverBicgstab<Vector<double>> solver(solver_control);
+
+    solver.solve(velocity_global_mat, velocity_star, velocity_rhs, PreconditionIdentity());
+    velocity_constraints.distribute(velocity_star);
+
+    std::cout << solver_control.last_step() 
+              << " BiCGStab iterations for intermediate velocity." << std::endl;
 }
-void INSSolver::solve_pressure() {
-    SolverControl solver_control(10000, 1e-6 * pressure_rhs.l2_norm());
+
+void INSSolver::solve_pressure()
+{
+    SolverControl solver_control(100000, 1e-12 * pressure_rhs.l2_norm());
     SolverCG<Vector<double>> solver(solver_control);
+
     solver.solve(pressure_global_mat, p, pressure_rhs, PreconditionIdentity());
-    std::cout << solver_control.last_step() << "  CG iterations needed to obtain convergence in Pressure." << std::endl;
+    pressure_constraints.distribute(p);
+
+    std::cout << solver_control.last_step() 
+              << " CG iterations for pressure." << std::endl;
 }
 
 void INSSolver::project()
 {
-    x_velocity_rhs = 0.0; //repurposing
-    y_velocity_rhs = 0.0;
+    velocity_global_mat = 0.0;
+    velocity_rhs = 0.0;
 
-    QGauss<DIM> quadrature(fe_velocity.degree + 1);
-    FEValues<DIM> fe_v(fe_velocity, quadrature,
+    const QGauss<DIM> quadrature(fe_velocity.degree + 1);
+    FEValues<DIM> fe_v(fe_velocity, quadrature, 
                        update_values | update_gradients | update_JxW_values);
-    FEValues<DIM> fe_p(fe_pressure, quadrature,
-                       update_values);
+    FEValues<DIM> fe_p(fe_pressure, quadrature, update_values);
 
-    const unsigned int dofs_per_cell_v = fe_velocity.dofs_per_cell;
+    const unsigned int dofs = fe_velocity.n_dofs_per_cell();
     const unsigned int n_q = quadrature.size();
 
-    Vector<double> local_rhs_x(dofs_per_cell_v);
-    Vector<double> local_rhs_y(dofs_per_cell_v);
-    std::vector<types::global_dof_index> local_dofs_v(dofs_per_cell_v);
+    FullMatrix<double> local_mass(dofs, dofs);
+    Vector<double> local_rhs(dofs);
+    std::vector<types::global_dof_index> local_dofs(dofs);
 
     std::vector<double> p_values(n_q);
+    const FEValuesExtractors::Vector velocities(0);
 
     auto cell_v = dof_handler_velocity.begin_active();
     auto cell_p = dof_handler_pressure.begin_active();
@@ -414,81 +415,111 @@ void INSSolver::project()
     {
         fe_v.reinit(cell_v);
         fe_p.reinit(cell_p);
-
         fe_p.get_function_values(p, p_values);
 
-        local_rhs_x = 0.0;
-        local_rhs_y = 0.0;
+        local_mass = 0.0;
+        local_rhs = 0.0;
+        cell_v->get_dof_indices(local_dofs);
 
         for (unsigned int q = 0; q < n_q; ++q)
-            for (unsigned int i = 0; i < dofs_per_cell_v; ++i)
-            {
-                const Tensor<1,DIM> grad_phi = fe_v.shape_grad(i, q);
-
-                local_rhs_x(i) -= dt * p_values[q] * grad_phi[0] * fe_v.JxW(q);
-                local_rhs_y(i) -= dt * p_values[q] * grad_phi[1] * fe_v.JxW(q);
-            }
-
-        cell_v->get_dof_indices(local_dofs_v);
-
-        for (unsigned int i = 0; i < dofs_per_cell_v; ++i)
         {
-            x_velocity_rhs(local_dofs_v[i]) += local_rhs_x(i);
-            y_velocity_rhs(local_dofs_v[i]) += local_rhs_y(i);
+            for (unsigned int i = 0; i < dofs; ++i)
+            {
+                const Tensor<1, DIM> phi_i = fe_v[velocities].value(i, q);
+                const Tensor<2, DIM> grad_phi_i = fe_v[velocities].gradient(i, q);
+
+                for (unsigned int j = 0; j < dofs; ++j)
+                {
+                    const Tensor<1, DIM> phi_j = fe_v[velocities].value(j, q);
+                    
+                    // Mass matrix
+                    local_mass(i, j) += phi_i * phi_j * fe_v.JxW(q);
+                }
+
+                // RHS: dt * grad(p) · phi_i
+                for (unsigned int d = 0; d < DIM; ++d)
+                {
+                    local_rhs(i) += dt * p_values[q] * grad_phi_i[d][d] * fe_v.JxW(q);
+                }
+            }
         }
+
+        velocity_constraints.distribute_local_to_global(
+            local_mass, local_rhs, local_dofs, 
+            velocity_global_mat, velocity_rhs);
     }
 
-    // add M u*
-    x_global_mat.vmult_add(x_velocity_rhs, u_star_x);
-    y_global_mat.vmult_add(y_velocity_rhs, u_star_y);
+    // Add M·u_star to RHS
+    velocity_global_mat.vmult_add(velocity_rhs, velocity_star);
 
-    SolverControl solver_control(10000, 1e-6);
+    // Solve
+    SolverControl solver_control(100000, 1e-12 * velocity_rhs.l2_norm());
     SolverCG<> solver(solver_control);
     PreconditionJacobi<> preconditioner;
+    preconditioner.initialize(velocity_global_mat);
 
-    preconditioner.initialize(x_global_mat);
-    solver.solve(x_global_mat, u_x, x_velocity_rhs, preconditioner);
+    solver.solve(velocity_global_mat, velocity, velocity_rhs, preconditioner);
+    velocity_constraints.distribute(velocity);
 
-    preconditioner.initialize(y_global_mat);
-    solver.solve(y_global_mat, u_y, y_velocity_rhs, preconditioner);
+    std::cout << "Projection: " << solver_control.last_step() 
+              << " CG iterations" << std::endl;
 }
-
 
 void INSSolver::output(int IT)
 {
-    
-    ///
+    // Compute divergence per cell
+    Vector<double> divergence_per_cell(mesh.n_active_cells());
+
+    QGauss<DIM> quadrature(fe_velocity.degree + 1);
+    FEValues<DIM> fe_values(fe_velocity, quadrature,
+                            update_gradients | update_JxW_values);
+
+    const FEValuesExtractors::Vector velocities(0);
+    std::vector<Tensor<2, DIM>> grad_u(quadrature.size());
+
+    unsigned int cell_index = 0;
+    for (const auto &cell : dof_handler_velocity.active_cell_iterators())
     {
-        DataOut<DIM> data_out;
-        data_out.attach_dof_handler(dof_handler_velocity);
+        fe_values.reinit(cell);
+        fe_values[velocities].get_function_gradients(velocity, grad_u);
 
-        data_out.add_data_vector(u_x, "u_x");
-        data_out.add_data_vector(u_y, "u_y");
+        double div_u = 0.0;
+        double total_weight = 0.0;
 
-        data_out.build_patches();
+        for (unsigned int q = 0; q < quadrature.size(); ++q)
+        {
+            double div_at_q = trace(grad_u[q]);
+            div_u += div_at_q * fe_values.JxW(q);
+            total_weight += fe_values.JxW(q);
+        }
 
-        std::ostringstream filename;
-        filename << "Exports/Velocity/velocity_" << std::setfill('0') << std::setw(6) << IT << ".vtk";
-
-        std::ofstream output(filename.str());
-        data_out.write_vtk(output);
+        divergence_per_cell(cell_index) = div_u / total_weight;
+        ++cell_index;
     }
 
-    //pre
-    {
-        DataOut<DIM> data_out;
-        data_out.attach_dof_handler(dof_handler_pressure);
+    // Output using DataOut
+    DataOut<DIM> data_out;
+    data_out.attach_dof_handler(dof_handler_velocity);
 
-        data_out.add_data_vector(p, "p");
+    // Split velocity into components for visualization
+    std::vector<std::string> velocity_names(DIM, "velocity");
+    std::vector<DataComponentInterpretation::DataComponentInterpretation>
+        velocity_component_interpretation(
+            DIM, DataComponentInterpretation::component_is_part_of_vector);
 
-        data_out.build_patches();
+    data_out.add_data_vector(velocity, velocity_names, 
+                            DataOut<DIM>::type_dof_data,
+                            velocity_component_interpretation);
 
-        std::ostringstream filename;
-        filename << "Exports/Pressure/pressure_" << std::setfill('0') << std::setw(6) << IT << ".vtk";
+    data_out.add_data_vector(dof_handler_pressure, p, "pressure");
+    data_out.add_data_vector(divergence_per_cell, "divergence");
 
-        std::ofstream output(filename.str());
-        data_out.write_vtk(output);
-    }
+    data_out.build_patches();
+
+    std::ostringstream filename;
+    filename << "Exports/solution_" << std::setfill('0') << std::setw(6) << IT << ".vtk";
+    std::ofstream output(filename.str());
+    data_out.write_vtk(output);
 
     std::cout << "Output written for step " << IT << std::endl;
 }
